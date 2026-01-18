@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+pydantic
+sqlalchemy
+asyncpg
+aio_pika
+pytest
+pytest-asyncio
+coverage
+prometheus-fastapi-instrumentator
