@@ -1,0 +1,200 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master, develop ]
+  pull_request:
+    branches: [ main, master, develop ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      db:
+        image: postgres:15
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      rabbitmq:
+        image: rabbitmq:3-management
+        env:
+          RABBITMQ_DEFAULT_USER: guest
+          RABBITMQ_DEFAULT_PASS: guest
+        ports:
+          - 5672:5672
+          - 15672:15672
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest pytest-asyncio pytest-cov pytest-mock httpx
+
+      - name: Wait for services
+        run: |
+          echo "Waiting for PostgreSQL..."
+          timeout 60 bash -c 'until pg_isready -h localhost -p 5432; do sleep 1; done'
+          echo "PostgreSQL is ready!"
+          
+          echo "Waiting for RabbitMQ..."
+          timeout 60 bash -c 'until curl -s http://localhost:15672 > /dev/null; do sleep 1; done'
+          echo "RabbitMQ is ready!"
+
+      - name: Run tests with coverage
+        env:
+          DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/postgres
+          RABBITMQ_URL: amqp://guest:guest@localhost/
+        run: |
+          python -m pytest app/test_main.py -v \
+            --cov=app \
+            --cov-report=term-missing \
+            --cov-report=xml \
+            --cov-report=html \
+            --cov-report=json \
+            --cov-fail-under=90 \
+            --asyncio-mode=auto \
+            --junitxml=junit.xml \
+            2>&1 | tee pytest-output.txt
+
+      - name: Generate Test Summary
+        if: always()
+        run: |
+          echo "## 🧪 Test Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Парсинг результатов pytest
+          if [ -f pytest-output.txt ]; then
+            PASSED=$(grep -oP '\d+(?= passed)' pytest-output.txt | tail -1 || echo "0")
+            FAILED=$(grep -oP '\d+(?= failed)' pytest-output.txt | tail -1 || echo "0")
+            SKIPPED=$(grep -oP '\d+(?= skipped)' pytest-output.txt | tail -1 || echo "0")
+            WARNINGS=$(grep -oP '\d+(?= warning)' pytest-output.txt | tail -1 || echo "0")
+            
+            echo "### Test Statistics" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "| Metric | Count |" >> $GITHUB_STEP_SUMMARY
+            echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+            echo "| ✅ Passed | $PASSED |" >> $GITHUB_STEP_SUMMARY
+            echo "| ❌ Failed | $FAILED |" >> $GITHUB_STEP_SUMMARY
+            echo "| ⏭️ Skipped | $SKIPPED |" >> $GITHUB_STEP_SUMMARY
+            echo "| ⚠️ Warnings | $WARNINGS |" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          if [ -f pytest-output.txt ]; then
+            # Вариант 1: ищем "TOTAL ... XX%"
+            COVERAGE=$(grep "TOTAL" pytest-output.txt | grep -oP '\d+%' | grep -oP '\d+' | tail -1 || echo "")
+            
+            # Вариант 2: если не нашли, ищем "Total coverage: XX.XX%"
+            if [ -z "$COVERAGE" ]; then
+              COVERAGE=$(grep -i "total coverage" pytest-output.txt | grep -oP '\d+\.\d+|\d+' | head -1 || echo "")
+            fi
+            
+            # Вариант 3: ищем строку с процентом в конце
+            if [ -z "$COVERAGE" ]; then
+              COVERAGE=$(grep "Required test coverage" pytest-output.txt | grep -oP '\d+\.\d+|\d+' | tail -1 || echo "")
+            fi
+            
+            # Округляем если есть дробная часть
+            if [ -n "$COVERAGE" ]; then
+              COVERAGE=$(printf "%.0f" "$COVERAGE" 2>/dev/null || echo "$COVERAGE")
+            else
+              COVERAGE="N/A"
+            fi
+            
+            echo "### 📊 Code Coverage" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            
+            if [ "$COVERAGE" != "N/A" ]; then
+              # Определяем эмодзи и цвет на основе процента покрытия
+              if [ "$COVERAGE" -ge 90 ] 2>/dev/null; then
+                BADGE_COLOR="brightgreen"
+                EMOJI="🟢"
+              elif [ "$COVERAGE" -ge 80 ] 2>/dev/null; then
+                BADGE_COLOR="green"
+                EMOJI="🟡"
+              elif [ "$COVERAGE" -ge 70 ] 2>/dev/null; then
+                BADGE_COLOR="yellow"
+                EMOJI="🟠"
+              else
+                BADGE_COLOR="red"
+                EMOJI="🔴"
+              fi
+              
+              echo "#### $EMOJI Total Coverage: **${COVERAGE}%**" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "![Coverage](https://img.shields.io/badge/coverage-${COVERAGE}%25-${BADGE_COLOR})" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "#### ⚠️ Coverage data not available" >> $GITHUB_STEP_SUMMARY
+            fi
+            echo "" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          # Время выполнения
+          if [ -f pytest-output.txt ]; then
+            DURATION=$(grep -oP '\d+\.\d+(?=s)' pytest-output.txt | tail -1 || echo "N/A")
+            echo "⏱️ **Test Duration:** ${DURATION}s" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+         
+
+      - name: Upload coverage reports
+        uses: codecov/codecov-action@v4
+        if: always()
+        with:
+          file: ./coverage.xml
+          flags: unittests
+          name: codecov-umbrella
+          fail_ci_if_error: false
+
+      - name: Upload coverage HTML
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-report
+          path: htmlcov/
+          retention-days: 30
+
+  docker-build:
+    runs-on: ubuntu-latest
+    needs: [test]
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image
+        run: |
+          docker build -t backend-app:test .
+
+      - name: Test Docker image
+        run: |
+          docker images backend-app:test
